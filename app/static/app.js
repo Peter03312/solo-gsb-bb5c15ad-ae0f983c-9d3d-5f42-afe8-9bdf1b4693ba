@@ -13,6 +13,8 @@ const S = {
   relate: { aId: null, bId: null, markersA: [], markersB: [], preview: null },
   // 轮廓修订会话：fid 修订片；points 编辑中的修订轮廓；relMarkers {rid: 局部标记}
   revise: null,
+  // 整体校准预览会话（锚点 + 只读预览；确认前不写库）
+  cal: null,
   trial: { steps: [], rehearsal: null, busy: false },
   // 历史版本：versions 版本清单；view 只读查看的历史版；restore 恢复预览
   history: { versions: [], view: null, restore: null, busy: false },
@@ -65,6 +67,7 @@ async function loadAssembly() {
   S.relations = data.relations;
   S.trial = { steps: [], rehearsal: null, busy: false };  // 刷新后旧试拼作废
   S.revise = null;                                        // 刷新后旧修订会话作废
+  S.cal = null;                                           // 刷新后旧校准预览作废
   S.history.view = null;
   S.history.restore = null;
   $('#versionBadge').textContent = `版本 v${S.version}`;
@@ -82,7 +85,7 @@ function handleConflict(err) {
 const SOURCE_LABELS = {
   baseline: '基线', create: '录入碎片', delete: '删除碎片', accept: '采纳拼接',
   undo: '撤销拼接', trial: '有序试拼确认', revision: '轮廓修订确认',
-  restore: '版本恢复',
+  calibration: '整体校准确认', restore: '版本恢复',
 };
 const sourceLabel = s => SOURCE_LABELS[s] || s;
 
@@ -157,13 +160,29 @@ async function confirmRestore() {
   }
 }
 
-// 画布上优先展示的覆盖装配：恢复预览（蓝）> 只读历史版（紫）> 试拼预演（蓝）
+// 画布上优先展示的覆盖装配：校准预览（蓝/橙）> 恢复预览（蓝）> 只读历史版（紫）> 试拼预演（蓝）
 function overlayAssembly() {
+  if (S.cal) return { kind: 'cal', a: calAssembly() };
   const h = S.history;
   if (h.restore) return { kind: 'restore', a: h.restore.restored_assembly };
   if (h.view) return { kind: 'history', a: h.view.assembly };
   const r = S.trial.rehearsal;
   return r && r.ok ? { kind: 'trial', a: r.assembly } : null;
+}
+
+// ---------------------------------------------------------------- 整体校准
+function calAssembly() {
+  // 校准预览：以校准后位姿构造一份装配（轮廓/标记/关系/分组均不变，仅位姿变）
+  const pv = S.cal;
+  const poseById = {};
+  for (const f of pv.fragments) poseById[f.fragment_id] = f;
+  const fragments = S.fragments.map(f => {
+    const p = poseById[f.id];
+    return p
+      ? { ...f, x: p.x_after, y: p.y_after, theta: p.theta_after }
+      : f;
+  });
+  return { version: S.version, fragments, groups: S.groups, relations: S.relations };
 }
 
 // ---------------------------------------------------------------- 有序试拼
@@ -365,8 +384,42 @@ function renderMain() {
   for (const f of viewFrags) {
     if (pvIds.has(f.id)) continue;
     if (S.mode === 'revise' && f.id === S.revise.fid) continue;  // 修订片单独绘制
-    drawFragment(f, { faint: S.mode === 'draw' || S.mode === 'revise',
-      color: ov ? ovColor : groupColor(f.group_id) });
+    let color = ov ? ovColor : groupColor(f.group_id);
+    let faint = S.mode === 'draw' || S.mode === 'revise';
+    if (ov && ov.kind === 'cal') {
+      const calRow = S.cal.fragments.find(x => x.fragment_id === f.id);
+      if (calRow) color = calRow.anchor ? '#d35400' : '#2e86c1';
+      else faint = true;   // 组外碎片淡显
+    }
+    drawFragment(f, { faint, color });
+  }
+
+  // 整体校准预览：校准后组内轮廓（蓝）与校准前轮廓（淡灰虚线）叠加；
+  // 标记对按校准后位姿连线，标注逐对误差（绿 ≤1mm / 红超限）
+  if (ov && ov.kind === 'cal') {
+    const curById = Object.fromEntries(S.fragments.map(x => [x.id, x]));
+    const afterById = Object.fromEntries(viewFrags.map(x => [x.id, x]));
+    for (const fr of S.cal.fragments) {
+      if (fr.anchor) continue;   // 锚点与校准前重合，无需灰虚线
+      const before = curById[fr.fragment_id];
+      const wc = worldContour(before);
+      const path = pathOf(wc);
+      ctx.setLineDash([5, 4]);
+      ctx.strokeStyle = '#9a9186';
+      ctx.lineWidth = 1;
+      ctx.stroke(path);
+      ctx.setLineDash([]);
+    }
+    for (const rw of S.cal.relations) {
+      const fa = afterById[rw.fragment_a], fb = afterById[rw.fragment_b];
+      if (!fa || !fb) continue;
+      rw.markers_a.forEach((ma, i) => {
+        const e = rw.errors_after[i];
+        drawMarkerPair(applyPose(ma, fa), applyPose(rw.markers_b[i], fb), i,
+          e == null ? '' : ` ${(+e).toFixed(2)}mm`,
+          e <= 1 ? '#27ae60' : '#c0392b');
+      });
+    }
   }
 
   // 轮廓修订：以现有位姿展示编辑中的修订轮廓（橙色高亮）
@@ -418,7 +471,7 @@ function renderMain() {
   }
 
   // 已有关系的标记（查看模式；历史版含已撤销关系，按覆盖装配绘制）
-  if (S.mode === 'view') {
+  if (S.mode === 'view' && !(ov && ov.kind === 'cal')) {
     const byId = Object.fromEntries(viewFrags.map(f => [f.id, f]));
     for (const r of viewRels) {
       if (!r.active) continue;
@@ -459,7 +512,7 @@ const deg = r => (r * 180 / Math.PI).toFixed(2);
 
 function renderPanel() {
   const el = $('#panel');
-  if (S.mode === 'view') el.innerHTML = viewPanelHTML();
+  if (S.mode === 'view') el.innerHTML = S.cal ? calibrationPanelHTML() : viewPanelHTML();
   else if (S.mode === 'draw') el.innerHTML = drawPanelHTML();
   else if (S.mode === 'revise') el.innerHTML = revisePanelHTML();
   else el.innerHTML = relatePanelHTML();
@@ -467,7 +520,9 @@ function renderPanel() {
   if (S.mode === 'relate') drawMinis();
   if (S.mode === 'revise') drawRevisionMinis();
   $('#hint').textContent = {
-    view: S.history.restore
+    view: S.cal
+      ? `整体校准预览（锚点 #${S.cal.anchor_id} 固定，蓝色为校准后位姿，不写库）· 侧栏核对调整前后位姿、逐关系误差与轮廓冲突后确认 · 拖拽平移 · 滚轮缩放`
+      : S.history.restore
       ? `恢复预览：恢复到 v${S.history.restore.target_version} 后的完整装配（蓝色，未改当前数据）· 侧栏可核对碎片/关系差异并确认恢复 · 拖拽平移 · 滚轮缩放`
       : S.history.view
         ? `历史版本 v${S.history.view.version} 只读查看（紫色，未改当前数据）· 碎片轮廓/位姿/连通组/有效及已撤销关系 · 拖拽平移 · 滚轮缩放`
@@ -492,6 +547,7 @@ function viewPanelHTML() {
       <div class="row">
         <span><span class="dot" style="background:${groupColor(f.group_id)}"></span><b>#${f.id} ${esc(f.name)}</b></span>
         <span class="spacer"></span>
+        ${f.group_id == null ? '' : `<button class="act" data-cal-frag="${f.id}">整体校准</button>`}
         <button class="act" data-revise-frag="${f.id}">修订轮廓</button>
         <button class="act danger" data-del-frag="${f.id}">删除</button>
       </div>
@@ -634,6 +690,73 @@ function restorePanelHTML() {
     <h2>恢复后连通组</h2><div class="small">${esc(groupText(a.groups))}</div>
     <h2>恢复后碎片（${a.fragments.length}）</h2>${historyFragCards(a)}
     <h2>恢复后关系（${a.relations.length}，含已撤销）</h2>${historyRelCards(a)}`;
+}
+
+// ---------------------------------------------------------------- 整体校准面板
+function calibrationPanelHTML() {
+  const pv = S.cal;
+  const stale = pv.expected_version !== S.version;
+  const fragRows = pv.fragments.map(f => `
+    <tr${f.anchor ? ' class="cal-anchor"' : ''}>
+      <td>${f.anchor ? '⚓' : ''}#${f.fragment_id} ${esc(f.name)}${f.anchor ? '（锚点）' : ''}</td>
+      <td>${fmt(f.x_before)}</td><td>${fmt(f.y_before)}</td><td>${fmt(f.theta_deg_before)}°</td>
+      <td>${fmt(f.x_after)}</td><td>${fmt(f.y_after)}</td><td>${fmt(f.theta_deg_after)}°</td>
+      <td>${f.anchor ? '固定' : `Δ(${fmt(f.dx)}, ${fmt(f.dy)}) ${fmt(f.dtheta_deg)}°`}</td>
+    </tr>`).join('');
+  const relRows = pv.relations.map(rw => {
+    const pairs = rw.errors_after.map((e, i) => {
+      const b = rw.errors_before[i];
+      return `第 ${i + 1} 对：${fmt(b, 3)} → <b class="${e <= 1 ? 'oktxt' : 'errtxt'}">${fmt(e, 3)}</b> mm ${e <= 1 ? '✓' : '✗'}`;
+    }).join('；');
+    return `<tr>
+      <td>#${rw.relation_id}（#${rw.fragment_a} ↔ #${rw.fragment_b}，${rw.marker_pairs} 对）</td>
+      <td>${fmt(rw.max_error_before_mm, 3)}</td>
+      <td><b class="${rw.max_error_after_mm <= 1 ? 'oktxt' : 'errtxt'}">${fmt(rw.max_error_after_mm, 3)}</b></td>
+      <td>${esc(pairs)}</td></tr>`;
+  }).join('');
+  const overlaps = pv.overlaps.map(o =>
+    `<li>碎片「${esc(o.name_a)}」与「${esc(o.name_b)}」校准后轮廓内部重叠 ${fmt(o.area_mm2, 2)} mm²</li>`).join('');
+  const cond = (ok, txt) =>
+    `<div class="${ok ? 'okbox' : 'conflicts'}" style="margin:4px 0">${ok ? '✓' : '✗'} ${txt}</div>`;
+  return `
+    <div class="okbox hist-banner">⚓ 整体校准预览：锚点 <b>#${pv.anchor_id}</b> 固定，
+      连通组（${esc(pv.fragment_ids.join(', '))}）内 ${pv.relation_count} 条有效关系
+      共 ${pv.relations.reduce((n, r) => n + r.marker_pairs, 0)} 对标记联合最小二乘
+      （${pv.iterations} 次迭代）。当前 v${S.version} 数据尚未改变。</div>
+    ${stale ? `<div class="conflicts">预览依据的版本 v${pv.expected_version} 已过期（当前 v${S.version}），
+       请返回后重新预览；此预览不可确认。</div>` : ''}
+    <div class="row" style="margin:6px 0">
+      <button class="act" id="btnCalBack">返回当前装配</button>
+      <button class="act" id="btnCalRepreview">重新预览</button>
+      <button class="act primary" id="btnCalConfirm"
+        ${pv.ok && !stale ? '' : 'disabled'}>确认校准（版本 v${S.version} → v${S.version + 1}）</button>
+    </div>
+    <h2>确认条件</h2>
+    ${cond(pv.strictly_improved,
+      `误差总量严格下降：SSE ${fmt(pv.sse_before_mm2, 4)} → ${fmt(pv.sse_after_mm2, 4)} mm²`
+      + `（Δ ${fmt(pv.sse_delta_mm2, 4)} mm²）`)}
+    ${cond(pv.ok || pv.relations.every(r => r.max_error_after_mm <= 1),
+      '校准后每对对应点误差均 ≤ 1 mm')}
+    ${cond(pv.overlaps.length === 0,
+      `校准后组内轮廓内部不重叠（允许共边/共点）${pv.overlaps.length ? `，发现 ${pv.overlaps.length} 处重叠` : ''}`)}
+    ${pv.conflicts.length
+      ? `<div class="conflicts"><b>不满足确认条件，保持现状（不落库）：</b>
+           <ul>${pv.conflicts.map(c => `<li>${esc(c)}</li>`).join('')}</ul></div>`
+      : '<div class="small">三条确认条件均满足，可确认。</div>'}
+    <h2>调整前 → 后位姿</h2>
+    <table class="info">
+      <tr><th>碎片</th><th>x₀</th><th>y₀</th><th>θ₀</th><th>x₁</th><th>y₁</th><th>θ₁</th><th>变化</th></tr>
+      ${fragRows}
+    </table>
+    <h2>逐关系误差（前 → 后）</h2>
+    <table class="info">
+      <tr><th>关系</th><th>最大误差₀</th><th>最大误差₁</th><th>逐对对应点误差 (mm)</th></tr>
+      ${relRows}
+    </table>
+    ${overlaps ? `<div class="conflicts"><b>轮廓冲突：</b><ul>${overlaps}</ul></div>` : ''}
+    <div class="small">仅调整非锚点碎片的平移和旋转；锚点位姿、碎片轮廓、标记、
+      关系 ID/状态与连通分组均不变。确认在同一事务内重算校验并更新位姿与有效关系误差，
+      版本只 +1 并留下不可改快照。</div>`;
 }
 
 function trialPanelHTML() {
@@ -845,6 +968,8 @@ function revisePanelHTML() {
 // ---------------------------------------------------------------- 面板事件
 function bindPanelEvents() {
   document.querySelectorAll('[data-del-frag]').forEach(b => b.onclick = () => deleteFragment(+b.dataset.delFrag));
+  document.querySelectorAll('[data-cal-frag]').forEach(b =>
+    b.onclick = () => previewCalibration(+b.dataset.calFrag));
   document.querySelectorAll('[data-revise-frag]').forEach(b =>
     b.onclick = () => startRevision(+b.dataset.reviseFrag));
   document.querySelectorAll('[data-undo]').forEach(b => b.onclick = () => undoRelation(+b.dataset.undo));
@@ -862,6 +987,12 @@ function bindPanelEvents() {
   if (btnHistRestore) btnHistRestore.onclick = () => previewRestore(S.history.view.version);
   const btnHistConfirm = document.getElementById('btnHistConfirm');
   if (btnHistConfirm) btnHistConfirm.onclick = confirmRestore;
+  const btnCalBack = document.getElementById('btnCalBack');
+  if (btnCalBack) btnCalBack.onclick = closeCalibration;
+  const btnCalRepreview = document.getElementById('btnCalRepreview');
+  if (btnCalRepreview) btnCalRepreview.onclick = () => previewCalibration(S.cal.anchor_id);
+  const btnCalConfirm = document.getElementById('btnCalConfirm');
+  if (btnCalConfirm) btnCalConfirm.onclick = confirmCalibration;
   const btnClear = document.getElementById('btnTrialClear');
   if (btnClear) btnClear.onclick = clearTrial;
   const btnCommit = document.getElementById('btnTrialCommit');
@@ -1114,9 +1245,57 @@ function applyAssembly(a) {
   S.relations = a.relations;
   S.history.view = null;
   S.history.restore = null;
+  S.cal = null;
   $('#versionBadge').textContent = `版本 v${S.version}`;
   renderPanel(); renderMain();
   loadVersions();
+}
+
+// ---------------------------------------------------------------- 整体校准动作
+async function previewCalibration(anchorId) {
+  try {
+    const pv = await api(`/api/calibration/preview?anchor_id=${anchorId}`, {
+      method: 'POST',
+      body: JSON.stringify({ expected_version: S.version }),
+    });
+    S.cal = pv;
+    S.history.view = null;
+    S.history.restore = null;
+    renderPanel(); renderMain();
+    if (pv.ok) setMessage('整体校准预览：满足全部确认条件，可确认');
+    else setMessage('整体校准预览：' + pv.conflicts.join('；'), 'err');
+  } catch (err) {
+    if (err.status === 409) return handleConflict(err);
+    setMessage(detailText(err.detail), 'err');
+  }
+}
+
+function closeCalibration() {
+  S.cal = null;
+  renderPanel(); renderMain();
+}
+
+async function confirmCalibration() {
+  const pv = S.cal;
+  if (!pv || !pv.ok || pv.expected_version !== S.version) return;
+  const anchorId = pv.anchor_id;
+  try {
+    const res = await api(`/api/calibration/confirm?anchor_id=${anchorId}`, {
+      method: 'POST',
+      body: JSON.stringify({ expected_version: S.version }),
+    });
+    setMessage(`已以锚点 #${anchorId} 完成整体校准，装配版本 v${res.version}（锚点/轮廓/标记/关系状态/分组不变）`);
+    S.cal = null;
+    S.trial = { steps: [], rehearsal: null, busy: false };  // 版本已变，旧试拼作废
+    applyAssembly(res.assembly);
+  } catch (err) {
+    if (err.status === 409) return handleConflict(err);
+    if (err.detail && err.detail.anchor_id != null) {   // 400：服务端重新校验未通过
+      S.cal = err.detail;
+      renderPanel(); renderMain();
+    }
+    setMessage(detailText(err.detail), 'err');
+  }
 }
 
 // ---------------------------------------------------------------- 小图（局部坐标 + 标记捕捉）
@@ -1284,7 +1463,7 @@ canvas.addEventListener('wheel', e => {
 // ---------------------------------------------------------------- 模式切换
 function switchMode(mode) {
   if (S.mode === 'revise' && mode !== 'revise') S.revise = null;  // 离开修订页即结束会话
-  if (mode !== 'view') { S.history.view = null; S.history.restore = null; }
+  if (mode !== 'view') { S.history.view = null; S.history.restore = null; S.cal = null; }
   S.mode = mode;
   document.querySelectorAll('.mode-btn').forEach(b =>
     b.classList.toggle('active', b.dataset.mode === mode));

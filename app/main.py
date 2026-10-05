@@ -23,6 +23,13 @@
   确认须提交预览所依据的当前版本号，版本过期或目标版不存在均拒绝且不
   写入；成功时原子恢复该版碎片与关系的原 ID 及状态、重算连通组，装配
   版本只递增一次并留下新快照，旧快照仍可查（详见 history.py）。
+- 整体校准（/api/calibration/preview|confirm）：以一片为锚点，对其所在
+  连通组以全部有效关系的成对边缘标记联合最小化对应点误差平方和，只调整
+  其余碎片的平移和旋转；锚点位姿、轮廓、标记、关系状态及分组不变。预览
+  展示调整前后位姿、逐关系逐对误差与轮廓冲突，不写库；仅当误差总量严格
+  下降、每对误差均 ≤1 mm 且组内轮廓内部不重叠时可确认；确认在同一事务
+  内重算校验、更新位姿及有效关系误差，版本只 +1 并留不可改快照
+  （详见 calibration.py）。
 """
 from __future__ import annotations
 
@@ -35,7 +42,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import geometry, history, revision, trial
+from . import calibration, geometry, history, revision, trial
+from .calibration import CalibrationError, evaluate_calibration
 from .database import DB
 from .revision import RevisionError, evaluate_revision
 from .trial import TrialError, evaluate_proposal
@@ -113,6 +121,11 @@ class RevisionIn(BaseModel):
 
 class RestoreIn(BaseModel):
     # 预览所依据的当前装配版本；过期则 409 拒绝且不写入
+    expected_version: int
+
+
+class CalibrationIn(BaseModel):
+    # 预览/确认所依据的当前装配版本；过期则 409 拒绝且不写入
     expected_version: int
 
 
@@ -334,6 +347,136 @@ def confirm_revision(fid: int, payload: RevisionIn):
             raise HTTPException(500, "内部错误，本次操作未生效")
     return {"ok": True, "fragment_id": fid, "version": new_version,
             "assembly": d.assembly_state()}
+
+
+# ---------------------------------------------------------------- 整体校准 API
+
+def _calibration_response(anchor_id: int, expected_version: int, ev: dict) -> dict:
+    """把 evaluate_calibration 结果整理为预览/确认 400 明细共用的响应体。"""
+    frag_rows = []
+    for row in ev["fragments"]:
+        frag_rows.append({
+            "fragment_id": row["fragment_id"],
+            "name": row["name"],
+            "anchor": row["anchor"],
+            "group_id": row["group_id"],
+            "moved": row["moved"],
+            "x_before": round(row["x_before"], 4),
+            "y_before": round(row["y_before"], 4),
+            "theta_deg_before": round(math.degrees(row["theta_before"]), 4),
+            "x_after": round(row["x_after"], 4),
+            "y_after": round(row["y_after"], 4),
+            "theta_after": row["theta_after"],
+            "theta_deg_after": round(math.degrees(row["theta_after"]), 4),
+            "dx": round(row["dx"], 4),
+            "dy": round(row["dy"], 4),
+            "dtheta_deg": round(math.degrees(row["dtheta"]), 4),
+        })
+    rel_rows = []
+    for row in ev["relations"]:
+        rel_rows.append({
+            "relation_id": row["relation_id"],
+            "fragment_a": row["fragment_a"],
+            "fragment_b": row["fragment_b"],
+            "marker_pairs": row["marker_pairs"],
+            "errors_before": [round(e, 4) for e in row["errors_before"]],
+            "errors_after": [round(e, 4) for e in row["errors_after"]],
+            "max_error_before_mm": round(row["max_error_before"], 4),
+            "max_error_after_mm": round(row["max_error_after"], 4),
+            "markers_a": row["markers_a"],
+            "markers_b": row["markers_b"],
+        })
+    return {
+        "ok": ev["ok"],
+        "anchor_id": anchor_id,
+        "expected_version": expected_version,
+        "fragment_ids": ev["fragment_ids"],
+        "relation_count": ev["relation_count"],
+        "iterations": ev["iterations"],
+        "sse_before_mm2": round(ev["sse_before"], 6),
+        "sse_after_mm2": round(ev["sse_after"], 6),
+        "sse_delta_mm2": round(ev["sse_delta"], 6),
+        "strictly_improved": ev["strictly_improved"],
+        "fragments": frag_rows,
+        "relations": rel_rows,
+        "overlaps": [
+            {"fragment_a": o["fragment_a"], "fragment_b": o["fragment_b"],
+             "name_a": o["name_a"], "name_b": o["name_b"],
+             "area_mm2": round(o["area_mm2"], 6)}
+            for o in ev["overlaps"]
+        ],
+        "conflicts": ev["conflicts"],
+    }
+
+
+@app.post("/api/calibration/preview")
+def preview_calibration(payload: CalibrationIn, anchor_id: int):
+    """整体校准预览：调整前后位姿、逐关系逐对误差与轮廓冲突，不写库。
+
+    锚点不存在 → 404 anchor_not_found；所在组不足两片 → 400 group_too_small；
+    版本过期 → 409。
+    """
+    d = get_db()
+    with d.lock:
+        _check_version(d, payload.expected_version)
+        try:
+            ev = evaluate_calibration(d, anchor_id)
+        except CalibrationError as e:
+            raise HTTPException(e.status, e.detail())
+        return _calibration_response(anchor_id, payload.expected_version, ev)
+
+
+@app.post("/api/calibration/confirm", status_code=201)
+def confirm_calibration(payload: CalibrationIn, anchor_id: int):
+    """确认整体校准：同一锚点重新演算并原子提交。
+
+    - 只更新非锚点碎片位姿及组内有效关系的 max_error（重算校验）；
+      锚点位姿、碎片轮廓、标记、关系 ID / 状态、连通分组均不变；
+    - 误差总量未严格下降、任一对误差 >1 mm 或组内轮廓内部重叠 → 400，
+      附与预览同结构的逐条结果，不写入任何变化；
+    - 版本过期 → 409；锚点不存在 → 404；组不足两片 → 400；
+    - 成功后装配版本只 +1，并留下 source=calibration 的不可改快照。
+    """
+    d = get_db()
+    new_version = None
+    restored = None
+    with d.lock:
+        try:
+            d.conn.execute("BEGIN IMMEDIATE")
+            _check_version(d, payload.expected_version)
+            try:
+                ev = evaluate_calibration(d, anchor_id)
+            except CalibrationError as e:
+                raise HTTPException(e.status, e.detail())
+            if not ev["ok"]:
+                raise HTTPException(400, detail={
+                    "message": "整体校准未满足确认条件，未写入任何变化",
+                    **_calibration_response(
+                        anchor_id, payload.expected_version, ev),
+                })
+            # 仅更新非锚点碎片的平移和旋转；锚点位姿原样
+            for row in ev["fragments"]:
+                if row["anchor"]:
+                    continue
+                d.update_pose(row["fragment_id"],
+                             (row["x_after"], row["y_after"], row["theta_after"]))
+            # 组内有效关系：以新位姿重算最大对应点误差（标记本身不变）
+            for row in ev["relations"]:
+                d.update_relation_side(
+                    row["relation_id"], None, None, row["max_error_after"])
+            # 不调用 recompute_groups：有效关系与碎片成员都未变，分组保持不变
+            new_version = d.bump_version()
+            restored = d.assembly_state()
+            d.save_snapshot(new_version, "calibration", restored)
+            d.conn.commit()
+        except HTTPException:
+            d.conn.rollback()
+            raise
+        except Exception:
+            d.conn.rollback()
+            raise HTTPException(500, "内部错误，本次操作未生效")
+    return {"ok": True, "anchor_id": anchor_id, "version": new_version,
+            "assembly": restored}
 
 
 # ---------------------------------------------------------------- 拼接 API

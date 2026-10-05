@@ -170,3 +170,124 @@ def find_overlaps(placed) -> list[tuple]:
                 overlaps.append((polys[i][0], polys[j][0],
                                  polys[i][1], polys[j][1], area))
     return overlaps
+
+
+# ---------------------------------------------------------------- 整体校准（最小二乘）
+
+def _solve_linear(A, b) -> list[float]:
+    """高斯-若尔当消元（列主元）解稠密线性方程组 A x = b（小规模，k≤数百）。"""
+    n = len(A)
+    M = [list(A[i]) + [b[i]] for i in range(n)]
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(M[r][col]))
+        if abs(M[pivot][col]) < 1e-14:
+            continue                    # 理论上不会出现：连通组约束满秩
+        if pivot != col:
+            M[col], M[pivot] = M[pivot], M[col]
+        q = M[col][col]
+        for j in range(col, n + 1):
+            M[col][j] /= q
+        for r in range(n):
+            if r == col:
+                continue
+            f = M[r][col]
+            if f:
+                for j in range(col, n + 1):
+                    M[r][j] -= f * M[col][j]
+    return [M[i][n] for i in range(n)]
+
+
+def poses_sse(poses: dict, corrs: list[tuple]) -> float:
+    """全部对应点在世界坐标下的误差平方和 Σ‖T_u(p)−T_v(q)‖²（mm²）。"""
+    sse = 0.0
+    for u, p, v, q in corrs:
+        wu = apply_pose(p, poses[u])
+        wv = apply_pose(q, poses[v])
+        dx, dy = wu[0] - wv[0], wu[1] - wv[1]
+        sse += dx * dx + dy * dy
+    return sse
+
+
+def calibrate_poses(poses: dict, corrs: list[tuple], fixed_id,
+                    max_iter: int = 50, tol: float = 1e-12):
+    """以 fixed_id 为锚点（位姿保持不变），对其余碎片仅以平移+旋转做联合
+    最小二乘，共同降低全部对应点的误差平方和::
+
+        E = Σ ‖R(θ_u)·p + t_u − (R(θ_v)·q + t_v)‖²
+
+    - poses: {fid: (x, y, theta)}，锚点以外为待调碎片（初值取当前位姿，
+      从当前位姿附近寻优，不会发生翻转/缩放）；
+    - corrs: [(uid, (px, py), vid, (qx, qy))]，即各有效关系展开的成对标记；
+    - Levenberg–Marquardt（解析雅可比，仅在误差下降时接受步长）。
+
+    返回 (new_poses, sse_before, sse_after, iterations)；new_poses 含组内
+    全部碎片，锚点位姿原样保留。
+    """
+    others = sorted(fid for fid in poses if fid != fixed_id)
+    base = {fid: 3 * i for i, fid in enumerate(others)}
+
+    x0: list[float] = []
+    for fid in others:
+        x0.extend(poses[fid])
+
+    def unpack(par):
+        out = {fixed_id: poses[fixed_id]}
+        for i, fid in enumerate(others):
+            out[fid] = (par[3 * i], par[3 * i + 1], par[3 * i + 2])
+        return out
+
+    def cost(par):
+        return poses_sse(unpack(par), corrs)
+
+    sse_before = cost(x0)
+    x = x0
+    lam = 1e-3
+    iters = 0
+    for it in range(1, max_iter + 1):
+        iters = it
+        cur = unpack(x)
+        k = len(x)
+        H = [[0.0] * k for _ in range(k)]
+        g = [0.0] * k
+        for u, p, v, q in corrs:
+            wu = apply_pose(p, cur[u])
+            wv = apply_pose(q, cur[v])
+            ex, ey = wu[0] - wv[0], wu[1] - wv[1]
+            # 残差 e = T_u(p) − T_v(q) 对各片 (tx, ty, theta) 的雅可比列
+            entries = []
+            cu, su = math.cos(cur[u][2]), math.sin(cur[u][2])
+            if u != fixed_id:
+                entries.append((base[u],
+                                (1.0, 0.0), (0.0, 1.0),
+                                (-su * p[0] - cu * p[1],
+                                 cu * p[0] - su * p[1])))
+            cv, sv = math.cos(cur[v][2]), math.sin(cur[v][2])
+            if v != fixed_id:
+                entries.append((base[v],
+                                (-1.0, 0.0), (0.0, -1.0),
+                                (sv * q[0] + cv * q[1],
+                                 -cv * q[0] + sv * q[1])))
+            for bi, j0, j1, j2 in entries:
+                for oi, jo in enumerate((j0, j1, j2)):
+                    g[bi + oi] += jo[0] * ex + jo[1] * ey
+                    for bj, k0, k1, k2 in entries:
+                        for oj, jn in enumerate((k0, k1, k2)):
+                            H[bi + oi][bj + oj] += jo[0] * jn[0] + jo[1] * jn[1]
+        Hd = [row[:] for row in H]
+        for i in range(k):
+            Hd[i][i] += lam * (H[i][i] if H[i][i] > 1e-18 else 1e-18)
+        delta = _solve_linear(Hd, [-gi for gi in g])
+        x_new = [x[i] + delta[i] for i in range(k)]
+        cur_sse = cost(x)
+        sse_new = cost(x_new)
+        if sse_new < cur_sse:
+            improved = cur_sse - sse_new
+            x = x_new
+            if improved <= tol * max(1.0, sse_new):
+                break
+            lam = max(lam * 0.5, 1e-12)
+        else:
+            lam *= 5.0
+            if lam > 1e12:
+                break
+    return unpack(x), sse_before, cost(x), iters

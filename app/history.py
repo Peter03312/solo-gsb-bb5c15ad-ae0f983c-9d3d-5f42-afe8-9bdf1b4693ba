@@ -22,6 +22,7 @@ SOURCE_LABELS = {
     "undo": "撤销拼接",
     "trial": "有序试拼确认",
     "revision": "轮廓修订确认",
+    "calibration": "整体校准确认",
     "restore": "版本恢复",
 }
 
