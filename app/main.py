@@ -16,6 +16,13 @@
   毫米制闭合轮廓及该片每条有效关系的新边缘标记，以现有位姿校验受影响组
   误差与碰撞；预览不落库，确认时重新校验同一输入并原子更新，位姿、关系
   ID、分组、已撤销历史不变，装配版本只 +1（详见 revision.py）。
+- 锚点整体校准（/api/calibration/preview|confirm）：修复师选一片作锚点，
+  锚点位姿固定，仅平移+旋转其余碎片，以连通组全部有效关系的成对边缘标记
+  共同最小化对应点误差平方和；预览给出调整前后位姿、逐关系误差与轮廓冲突
+  且不落库；仅当误差总量严格下降、每对对应点误差 ≤1mm、组内轮廓内部不
+  重叠时确认才原子写入位姿与有效关系误差，轮廓/标记/关系状态/分组不变，
+  装配版本只递增一次并留不可改快照；版本过期 409，锚点不存在 404、组不足
+  两片 400，均不写入（详见 calibration.py）。
 - 历史版本（/api/assembly/versions...）：每次成功变更都在同一事务内把
   完整装配（碎片/关系/连通组）固化为不可改版本快照；启用时当前状态记为
   基线。可查看任意历史版的碎片轮廓、位姿、有效及已撤销关系与连通组；
@@ -35,7 +42,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import geometry, history, revision, trial
+from . import calibration, geometry, history, revision, trial
+from .calibration import CalibrationError, evaluate_calibration
 from .database import DB
 from .revision import RevisionError, evaluate_revision
 from .trial import TrialError, evaluate_proposal
@@ -113,6 +121,12 @@ class RevisionIn(BaseModel):
 
 class RestoreIn(BaseModel):
     # 预览所依据的当前装配版本；过期则 409 拒绝且不写入
+    expected_version: int
+
+
+class CalibrationIn(BaseModel):
+    # 锚点碎片 id（位姿固定）+ 预览所依据的当前装配版本（过期 409）
+    anchor_id: int
     expected_version: int
 
 
@@ -334,6 +348,136 @@ def confirm_revision(fid: int, payload: RevisionIn):
             raise HTTPException(500, "内部错误，本次操作未生效")
     return {"ok": True, "fragment_id": fid, "version": new_version,
             "assembly": d.assembly_state()}
+
+
+# ---------------------------------------------------------------- 锚点整体校准 API
+
+def _calibration_response(anchor_id: int, expected_version: int,
+                          ev: dict) -> dict:
+    """把 evaluate_calibration 结果整理为预览/确认共用的响应体。"""
+    def r4(v: float) -> float:
+        v = round(v, 4)
+        return 0.0 if v == 0 else v   # 归一 -0.0，避免界面显示 -0.00
+
+    return {
+        "ok": ev["ok"],
+        "anchor_id": anchor_id,
+        "expected_version": expected_version,
+        "involved_fragment_ids": ev["involved"],
+        "sse_before_mm2": round(ev["sse_before"], 6),
+        "sse_after_mm2": round(ev["sse_after"], 6),
+        "sse_strictly_decreased": ev["strict_drop"],
+        "max_error_before_mm": round(ev["max_error_before"], 4),
+        "max_error_after_mm": round(ev["max_error_after"], 4),
+        "all_pair_errors_within_1mm": ev["all_within_tolerance"],
+        "conflicts": ev["conflicts"],
+        "poses": [
+            {
+                "fragment_id": p["fragment_id"],
+                "name": p["name"],
+                "anchor": p["anchor"],
+                "moved": p["moved"],
+                "before": {
+                    "x": r4(p["before"]["x"]),
+                    "y": r4(p["before"]["y"]),
+                    "theta_deg": r4(p["before"]["theta_deg"]),
+                },
+                "after": {
+                    "x": r4(p["after"]["x"]),
+                    "y": r4(p["after"]["y"]),
+                    "theta_deg": r4(p["after"]["theta_deg"]),
+                },
+            }
+            for p in ev["poses"]
+        ],
+        "relations": [
+            {
+                "relation_id": r["relation_id"],
+                "fragment_a": r["fragment_a"],
+                "fragment_b": r["fragment_b"],
+                "name_a": r["name_a"],
+                "name_b": r["name_b"],
+                "marker_pairs": r["marker_pairs"],
+                "errors_before": [round(e, 4) for e in r["errors_before"]],
+                "errors_after": [round(e, 4) for e in r["errors_after"]],
+                "max_error_before_mm": (round(r["max_error_before"], 4)
+                                        if r["max_error_before"] is not None
+                                        else None),
+                "max_error_after_mm": (round(r["max_error_after"], 4)
+                                       if r["max_error_after"] is not None
+                                       else None),
+            }
+            for r in ev["relations"]
+        ],
+        "overlaps": [
+            {"fragment_a": o["fragment_a"], "fragment_b": o["fragment_b"],
+             "name_a": o["name_a"], "name_b": o["name_b"],
+             "area_mm2": round(o["area_mm2"], 6)}
+            for o in ev["overlaps"]
+        ],
+    }
+
+
+@app.post("/api/calibration/preview")
+def preview_calibration(payload: CalibrationIn):
+    """锚点整体校准预览：固定锚点，仅平移+旋转其余碎片共同最小化误差。
+
+    返回调整前后各片位姿、逐关系逐对误差、误差总量与轮廓冲突；不落库。
+    版本过期 → 409；锚点不存在 → 404；所在组不足两片 → 400。
+    """
+    d = get_db()
+    with d.lock:
+        _check_version(d, payload.expected_version)
+        try:
+            ev = evaluate_calibration(d, payload.anchor_id)
+        except CalibrationError as e:
+            raise HTTPException(e.status, e.detail())
+        return _calibration_response(
+            payload.anchor_id, payload.expected_version, ev)
+
+
+@app.post("/api/calibration/confirm", status_code=201)
+def confirm_calibration(payload: CalibrationIn):
+    """确认锚点整体校准：重新演算并校验，原子更新其余碎片位姿与关系误差。
+
+    锚点位姿、轮廓、标记、关系状态与连通分组不变；仅当误差总量严格下降、
+    每对对应点误差 ≤ 1 mm 且组内轮廓内部不重叠时才写入，版本只 +1 并留下
+    source=calibration 的不可改快照；否则整次拒绝（不写入任何变化）。
+    版本过期 → 409；锚点不存在 → 404；组不足两片 → 400。
+    """
+    d = get_db()
+    with d.lock:
+        try:
+            d.conn.execute("BEGIN IMMEDIATE")
+            _check_version(d, payload.expected_version)
+            try:
+                ev = evaluate_calibration(d, payload.anchor_id)
+            except CalibrationError as e:
+                raise HTTPException(e.status, e.detail())
+            if not ev["ok"]:
+                raise HTTPException(400, detail={
+                    "message": "整体校准未满足确认条件，未写入任何变化，保持现状",
+                    **_calibration_response(
+                        payload.anchor_id, payload.expected_version, ev),
+                })
+            for fid, pose in ev["new_poses"].items():
+                d.update_pose(fid, pose)
+            for r in ev["relations"]:
+                # 标记未变：仅刷新每条有效关系的最新最大误差
+                d.update_relation_side(
+                    r["relation_id"], None, None, r["max_error_after"])
+            # 不调用 recompute_groups：拓扑未变，分组必须保持不变
+            new_version = d.bump_version()
+            d.save_snapshot(new_version, "calibration", d.assembly_state())
+            d.conn.commit()
+        except HTTPException:
+            d.conn.rollback()
+            raise
+        except Exception:
+            d.conn.rollback()
+            raise HTTPException(500, "内部错误，本次操作未生效")
+    return {"ok": True, "anchor_id": payload.anchor_id,
+            "version": new_version, "assembly": d.assembly_state()}
 
 
 # ---------------------------------------------------------------- 拼接 API
